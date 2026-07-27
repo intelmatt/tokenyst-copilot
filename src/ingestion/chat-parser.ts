@@ -235,8 +235,11 @@ function harvest(
 
   // GitHub's real credit cost is in `details` ("Model • 12.3 credits"), often in a
   // different delta object than the tokens — capture it by responseId and join later.
+  // `credits?\b` (not just the plural `credits`) so a request billed at exactly
+  // 1 (or a fractional amount GitHub renders with singular wording, e.g. "1 credit")
+  // is still recognized instead of silently falling back to a token-based estimate.
   if (responseId && typeof value['details'] === 'string') {
-    const m = (value['details'] as string).match(/([0-9.]+)\s*credits/i);
+    const m = (value['details'] as string).match(/([0-9.]+)\s*credits?\b/i);
     if (m) credits.set(responseId, parseFloat(m[1]));
   }
 
