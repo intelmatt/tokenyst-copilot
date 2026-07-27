@@ -22,16 +22,20 @@ export interface PerRequestUsage {
 /**
  * Per-session, per-model usage aggregated from a VS Code Copilot Chat session.
  *
- * `costUsd` is authoritative: where GitHub recorded a real credit value for a
- * request (in `details`, e.g. "… • 12.3 credits"), that value is used directly
- * (credits ÷ CREDITS_PER_USD); otherwise the request is priced from its tokens.
- * Token fields are retained for transparency. Aggregated per session+model and
- * upserted by a stable `externalId` (`copilot-chat-<sessionId>-<model>`).
+ * `costUsd` sums every request whose cost is *known* (a real GitHub credit
+ * value, or a built-in table match). Requests with no known price at all are
+ * never added here — not even as a `0` placeholder, since that would silently
+ * assert "this cost nothing" instead of "this is unknown". See
+ * `unpricedRequestCount` / `unpricedInputTokens` / `unpricedOutputTokens` for
+ * that excluded usage. Aggregated per session+model and upserted by a stable
+ * `externalId` (`copilot-chat-<sessionId>-<model>`).
  */
 export interface CopilotSessionUsage {
   sessionId: string;
   model: string;
+  /** Sum of every *priced* request (see the type doc comment above). */
   costUsd: number;
+  /** Input/output token totals across *priced* requests only (see `costUsd`). */
   inputTokens: number;
   outputTokens: number;
   /**
@@ -45,11 +49,23 @@ export interface CopilotSessionUsage {
   cacheReadTokens: number | null;
   timestamp: string;
   externalId: string;
-    /** Per-request usage details with timestamps. Used for daily attribution. */
+    /** Per-request usage details with timestamps. Only *priced* requests appear
+     * here — see `costUsd`. Used for daily attribution. */
     requests?: PerRequestUsage[];
   repo?: string;
   /** Human-readable title: the session's first user prompt (truncated). */
   title?: string;
+  /**
+   * Number of requests in this session+model with no known price at all: no
+   * real GitHub credit value and no exact/family pricing match. These
+   * contribute NOTHING to `costUsd` — not even a `$0` placeholder, since that
+   * would misrepresent "unknown" as "free". Omitted (undefined) when there are
+   * none. The UI must never blend this into the displayed total.
+   */
+  unpricedRequestCount?: number;
+  /** Input/output tokens belonging to the unpriced requests counted above. */
+  unpricedInputTokens?: number;
+  unpricedOutputTokens?: number;
 }
 
 export interface ChatSessionFile {
@@ -373,24 +389,32 @@ export function parseChatSession(file: string, sessionId: string, workspaceHash 
     costUsd: number; input: number; output: number;
     cacheCreation: number; cacheRead: number; cacheWritten: boolean;
     cacheReported: boolean;
+    /** Requests with no real GitHub credit value and no exact/family pricing
+     * match. Tracked entirely separately from `costUsd`/`input`/`output` —
+     * never blended in, not even as a `0`. */
+    unpricedCount: number;
+    unpricedInput: number;
+    unpricedOutput: number;
   }
   const perModel = new Map<string, ModelAcc>();
-    // Track per-request costs for daily attribution.
+    // Track per-request costs for daily attribution. Only priced requests get an
+    // entry here — see the ModelAcc doc comment above.
     const perRequestCosts = new Map<string, { costUsd: number; cacheCreation: number; cacheRead: number }>();
   for (const rec of records.values()) {
     const acc = perModel.get(rec.model)
-      ?? { costUsd: 0, input: 0, output: 0, cacheCreation: 0, cacheRead: 0, cacheWritten: false, cacheReported: false };
-    acc.input += rec.freshInputTokens + rec.cacheableTokens;
-    acc.output += rec.outputTokens;
+      ?? { costUsd: 0, input: 0, output: 0, cacheCreation: 0, cacheRead: 0, cacheWritten: false, cacheReported: false, unpricedCount: 0, unpricedInput: 0, unpricedOutput: 0 };
     if (rec.cacheReported) acc.cacheReported = true;
 
     const gh = credits.get(rec.responseId);
       let requestCostUsd = 0;
       let requestCacheCreation = 0;
       let requestCacheRead = 0;
+      let priced = true;
     if (gh != null) {
         requestCostUsd = gh / CREDITS_PER_USD;
       acc.costUsd += gh / CREDITS_PER_USD;
+      acc.input += rec.freshInputTokens + rec.cacheableTokens;
+      acc.output += rec.outputTokens;
     } else {
       let cc = 0, cr = 0;
       if (rec.cacheableTokens > 0) {
@@ -399,16 +423,33 @@ export function parseChatSession(file: string, sessionId: string, workspaceHash 
         requestCacheCreation = cc;
         requestCacheRead = cr;
       }
-      acc.cacheCreation += cc;
-      acc.cacheRead += cr;
-      requestCostUsd = calculateCost(rec.model, rec.freshInputTokens, rec.outputTokens, cc, cr) ?? 0;
+      const builtIn = calculateCost(rec.model, rec.freshInputTokens, rec.outputTokens, cc, cr);
+      if (builtIn != null) {
+        requestCostUsd = builtIn;
+        acc.cacheCreation += cc;
+        acc.cacheRead += cr;
+        acc.input += rec.freshInputTokens + rec.cacheableTokens;
+        acc.output += rec.outputTokens;
+      } else {
+        // Genuinely no known price for this model. Do NOT fabricate a number —
+        // not a guessed estimate, and not even a `0`, since either would
+        // misrepresent "unknown" as a real, accounted-for figure. Track it in a
+        // completely separate, non-monetary bucket instead, excluded from
+        // costUsd/input/output entirely.
+        priced = false;
+        acc.unpricedCount += 1;
+        acc.unpricedInput += rec.freshInputTokens + rec.cacheableTokens;
+        acc.unpricedOutput += rec.outputTokens;
+      }
       acc.costUsd += requestCostUsd;
     }
-    perRequestCosts.set(rec.responseId, {
-      costUsd: requestCostUsd,
-      cacheCreation: requestCacheCreation,
-      cacheRead: requestCacheRead,
-    });
+    if (priced) {
+      perRequestCosts.set(rec.responseId, {
+        costUsd: requestCostUsd,
+        cacheCreation: requestCacheCreation,
+        cacheRead: requestCacheRead,
+      });
+    }
     perModel.set(rec.model, acc);
   }
 
@@ -417,7 +458,9 @@ export function parseChatSession(file: string, sessionId: string, workspaceHash 
 
   const result: CopilotSessionUsage[] = [];
   for (const [model, acc] of perModel) {
-    if (acc.costUsd <= 0) continue;
+    // Keep a session even at costUsd === 0 when it has unpriced usage — dropping
+    // it here would silently hide genuinely-unknown spend from the UI.
+    if (acc.costUsd <= 0 && acc.unpricedCount === 0) continue;
         // Build requests array: filter per-model requests with their timestamps and costs
         const requests: PerRequestUsage[] = [];
         for (const rec of records.values()) {
@@ -450,6 +493,9 @@ export function parseChatSession(file: string, sessionId: string, workspaceHash 
       repo,
       title,
       requests: requests.length > 0 ? requests : undefined,
+      unpricedRequestCount: acc.unpricedCount > 0 ? acc.unpricedCount : undefined,
+      unpricedInputTokens: acc.unpricedCount > 0 ? acc.unpricedInput : undefined,
+      unpricedOutputTokens: acc.unpricedCount > 0 ? acc.unpricedOutput : undefined,
     });
   }
   return result;

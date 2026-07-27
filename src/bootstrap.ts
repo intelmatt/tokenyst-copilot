@@ -60,13 +60,18 @@ function formatDateYYYYMMDD(timestampMs: number): string {
  * Everything else falls back to a single session-level allocation.
  */
 function toAllocation(u: CopilotSessionUsage | CliSessionUsage, source: UsageSource): SessionResult[] {
-  if (u.costUsd <= 0) {
+  const chatUsage = u as CopilotSessionUsage;
+  const unpricedCount = chatUsage.unpricedRequestCount ?? 0;
+  if (u.costUsd <= 0 && unpricedCount === 0) {
     debugLog(`bootstrap: skipping ${u.externalId} — cost=0 (model=${u.model})`);
     return [];
   }
 
-  // If we have per-request timestamps, split by calendar day.
-  const chatUsage = u as CopilotSessionUsage;
+  const results: SessionResult[] = [];
+
+  // If we have per-request timestamps, split by calendar day. Every request in
+  // `chatUsage.requests` is already known-priced (see chat-parser.ts) — no
+  // unpriced usage is mixed in here, so these day totals are never fabricated.
   if (chatUsage.requests && chatUsage.requests.length > 0) {
     type DayAcc = {
       costUsd: number;
@@ -102,8 +107,7 @@ function toAllocation(u: CopilotSessionUsage | CliSessionUsage, source: UsageSou
       dayMap.set(midnightMs, existing);
     }
 
-    const results: SessionResult[] = [];
-    for (const [midnightMs, dayData] of dayMap) {
+    for (const [, dayData] of dayMap) {
       if (dayData.costUsd <= 0) continue;
       results.push({
         costUsd: dayData.costUsd,
@@ -123,8 +127,38 @@ function toAllocation(u: CopilotSessionUsage | CliSessionUsage, source: UsageSou
         responseIds: dayData.responseIds,
       });
     }
-    return results;
   }
+
+  // Unpriced usage has no per-request timestamps to split by day (it's tracked
+  // only as session-level totals — see chat-parser.ts). Record it as its own
+  // allocation rather than attributing it to a fabricated day, or folding it
+  // into one of the day totals above (which would misrepresent it as priced).
+  // `costUsd: 0` here is not a guess about the real cost — it is explicitly
+  // *excluded* from the verified total, and `unpricedRequestCount` tags it so
+  // the UI never presents it as part of a verified figure.
+  if (unpricedCount > 0) {
+    results.push({
+      costUsd: 0,
+      model: u.model,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: null,
+      cacheReadTokens: null,
+      filesModified: [],
+      provider: 'copilot',
+      externalId: `${u.externalId}-unpriced`,
+      repo: u.repo,
+      source,
+      at: u.timestamp,
+      sessionId: u.sessionId,
+      title: u.title,
+      unpricedRequestCount: unpricedCount,
+      unpricedInputTokens: chatUsage.unpricedInputTokens,
+      unpricedOutputTokens: chatUsage.unpricedOutputTokens,
+    });
+  }
+
+  if (results.length > 0) return results;
 
   // Fallback: no per-request data, create single allocation using session-level timestamp.
   return [{

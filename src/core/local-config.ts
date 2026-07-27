@@ -39,6 +39,14 @@ export interface LocalAllocation {
   /** responseIds counted in this allocation; used to deduplicate requests inherited
    * by forked sessions. Absent on legacy/CLI/manual allocations. */
   responseIds?: string[];
+  /** Number of requests this allocation represents with no known price at all
+   * (no credit, no built-in match). This allocation's own `costUsd` is 0 for
+   * these — deliberately excluded from the verified total, not a guess.
+   * Omitted when zero. */
+  unpricedRequestCount?: number;
+  /** Input/output tokens belonging to the unpriced requests counted above. */
+  unpricedInputTokens?: number;
+  unpricedOutputTokens?: number;
 }
 
 /** Unit used to display amounts in the UI. Cost is always stored in USD. */
@@ -98,6 +106,9 @@ function normalizeAllocation(a: unknown): LocalAllocation {
     responseIds: Array.isArray(raw.responseIds)
       ? (raw.responseIds as unknown[]).filter((v): v is string => typeof v === 'string')
       : undefined,
+    unpricedRequestCount: raw.unpricedRequestCount != null ? Number(raw.unpricedRequestCount) : undefined,
+    unpricedInputTokens: raw.unpricedInputTokens != null ? Number(raw.unpricedInputTokens) : undefined,
+    unpricedOutputTokens: raw.unpricedOutputTokens != null ? Number(raw.unpricedOutputTokens) : undefined,
   };
 }
 
