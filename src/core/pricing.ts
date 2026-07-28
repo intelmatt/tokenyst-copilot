@@ -107,16 +107,24 @@ function familyKey(c: string): string | null {
  * more accurate once it exists. Set `resolveModel(raw)` (no further arguments)
  * to check built-in pricing alone, e.g. to detect when an override has become
  * redundant (see `findSupersededOverrides`).
+ *
+ * `livePricing` is an optional map of live per-model rates sourced directly
+ * from the model provider via VS Code's *proposed, unstable*
+ * `languageModelPricing` API (see `core/live-model-pricing.ts`) — gated behind
+ * the `tokenyst.experimental.useLiveModelPricing` setting and empty in the
+ * published build (that build never declares the proposal). When present for
+ * a given model id, it takes priority over even the built-in table, since it
+ * reflects the provider's current real rate rather than a maintainer-curated
+ * snapshot that can go stale.
  */
 export function resolveModel(
   raw: string,
   overrides?: Readonly<Record<string, ManualPriceOverride>>,
-): { id: string; pricing: PricingEntry | null; manual?: boolean } {
+  livePricing?: Readonly<Record<string, PricingEntry>>,
+): { id: string; pricing: PricingEntry | null; manual?: boolean; live?: boolean } {
   const c = canon(raw);
   const key = CANON_TO_KEY.get(c);
-  if (key) return { id: key, pricing: MODEL_PRICING[key] };
-
-  const fam = familyKey(c);
+  const fam = !key ? familyKey(c) : undefined;
   const cleaned = raw
     .toLowerCase()
     .replace(/-\d{4}-\d{2}-\d{2}$/, '')
@@ -124,7 +132,12 @@ export function resolveModel(
     .trim()
     .replace(/\s+/g, '-')
     .replace(/^copilot-/, '');
-  const id = `copilot-${cleaned}`;
+  const id = key ?? `copilot-${cleaned}`;
+
+  const live = livePricing?.[id];
+  if (live) return { id, pricing: live, live: true };
+
+  if (key) return { id, pricing: MODEL_PRICING[key] };
   if (fam) return { id, pricing: MODEL_PRICING[fam] };
 
   const manualEntry = overrides?.[id];
@@ -140,8 +153,9 @@ export function calculateCost(
   cacheCreationTokens = 0,
   cacheReadTokens = 0,
   overrides?: Readonly<Record<string, ManualPriceOverride>>,
+  livePricing?: Readonly<Record<string, PricingEntry>>,
 ): number | null {
-  const { pricing } = resolveModel(model, overrides);
+  const { pricing } = resolveModel(model, overrides, livePricing);
   if (!pricing) return null;
 
   return (inputTokens / 1000000) * pricing.inputPerMillion
