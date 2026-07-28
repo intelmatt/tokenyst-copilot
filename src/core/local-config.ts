@@ -87,6 +87,18 @@ export interface LocalConfig {
    * (see `drainSupersededPriceNotices`).
    */
   pendingPriceSupersessions?: SupersededOverride[];
+  /**
+   * Opt-in, OFF by default. When false/unset (the default), unpriced usage
+   * (see `LocalAllocation.unpricedRequestCount`) is NEVER blended into any
+   * displayed spend total — it's shown, if at all, only as a separate "N
+   * requests with unknown cost" indicator. When the user explicitly turns
+   * this on, the UI is additionally allowed to show a clearly-labeled,
+   * separate "unverified estimate" figure computed by
+   * `estimateUnverifiedSpendUsd` (core/pricing.ts) — still never merged into
+   * or replacing the verified total, always rendered alongside it with a
+   * disclaimer (e.g. "$435 verified + up to ~$50 unverified estimate").
+   */
+  showUnverifiedEstimates?: boolean;
 }
 
 const DEFAULT_CONFIG: LocalConfig = {
@@ -96,6 +108,7 @@ const DEFAULT_CONFIG: LocalConfig = {
   renewalDay: null,
   displayUnit: 'credits',
   statusBarMetric: 'period',
+  showUnverifiedEstimates: false,
 };
 
 export function getConfigDir(): string {

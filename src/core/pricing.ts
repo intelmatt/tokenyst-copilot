@@ -186,3 +186,33 @@ export function findSupersededOverrides(
   }
   return out;
 }
+
+/**
+ * The rate used ONLY by `estimateUnverifiedSpendUsd`, for tokens Tokenyst has no
+ * real price for at all (no credit, no built-in match, no manual override).
+ * Deliberately the priciest known family tier, so the number this produces errs
+ * toward NOT under-promising a budget overrun if the user chooses to look at it.
+ *
+ * This is NOT used anywhere in the authoritative cost path (`calculateCost`,
+ * `resolveModel`). It exists solely to answer, on demand, "if I had to guess,
+ * about how much might this unpriced usage have cost?" — and every caller of
+ * `estimateUnverifiedSpendUsd` must render the result as a separate, clearly
+ * labeled, non-authoritative figure (e.g. "~$12 unverified estimate"), never
+ * merged into or replacing a verified total.
+ */
+const UNVERIFIED_ESTIMATE_RATE: PricingEntry = MODEL_PRICING['claude-opus'];
+
+/**
+ * Rough, explicitly-labeled *guess* at the dollar cost of usage Tokenyst has no
+ * real price for (see `CopilotSessionUsage.unpricedRequestCount` /
+ * `LocalAllocation.unpricedRequestCount`). This is a fabricated number by
+ * construction — it must NEVER be computed or displayed unless the user has
+ * explicitly opted in via `LocalConfig.showUnverifiedEstimates`, and even then
+ * only as a distinct, clearly-labeled figure alongside (never blended into)
+ * the verified `costUsd` total. Callers are responsible for enforcing both of
+ * those rules; this function only does the arithmetic.
+ */
+export function estimateUnverifiedSpendUsd(unpricedInputTokens: number, unpricedOutputTokens: number): number {
+  return (unpricedInputTokens / 1000000) * UNVERIFIED_ESTIMATE_RATE.inputPerMillion
+       + (unpricedOutputTokens / 1000000) * UNVERIFIED_ESTIMATE_RATE.outputPerMillion;
+}
