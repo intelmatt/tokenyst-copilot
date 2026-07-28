@@ -1,4 +1,10 @@
-import { applyCopilotSessionUpsert, loadConfig, mutateConfig, upsertCopilotSessionAllocation } from './core/local-config';
+import {
+  applyCopilotSessionUpsert,
+  loadConfig,
+  mutateConfig,
+  reconcileManualPriceOverrides,
+  upsertCopilotSessionAllocation,
+} from './core/local-config';
 import type { LocalAllocation } from './core/local-config';
 import type { SessionResult, UsageSource } from './core/types';
 import {
@@ -62,7 +68,8 @@ function formatDateYYYYMMDD(timestampMs: number): string {
 function toAllocation(u: CopilotSessionUsage | CliSessionUsage, source: UsageSource): SessionResult[] {
   const chatUsage = u as CopilotSessionUsage;
   const unpricedCount = chatUsage.unpricedRequestCount ?? 0;
-  if (u.costUsd <= 0 && unpricedCount === 0) {
+  const flagged = unpricedCount > 0 || chatUsage.hasManualPricing;
+  if (u.costUsd <= 0 && !flagged) {
     debugLog(`bootstrap: skipping ${u.externalId} — cost=0 (model=${u.model})`);
     return [];
   }
@@ -125,6 +132,7 @@ function toAllocation(u: CopilotSessionUsage | CliSessionUsage, source: UsageSou
         sessionId: u.sessionId,
         title: u.title,
         responseIds: dayData.responseIds,
+        hasManualPricing: chatUsage.hasManualPricing,
       });
     }
   }
@@ -176,6 +184,7 @@ function toAllocation(u: CopilotSessionUsage | CliSessionUsage, source: UsageSou
     at: u.timestamp,
     sessionId: u.sessionId,
     title: u.title,
+    hasManualPricing: chatUsage.hasManualPricing,
   }];
 }
 
@@ -241,6 +250,10 @@ export async function importHistory(since: string | null): Promise<number> {
   const cliFiles = findCliSessionFiles();
   debugLog(`import: scanning ${chatFiles.length} chat + ${cliFiles.length} cli session file(s) since ${since ?? 'beginning'}`);
 
+  // Drop any manual price override now made redundant by an official built-in
+  // entry, before it's used to price anything in this import.
+  await reconcileManualPriceOverrides();
+
   // Sort chat files oldest-first so original sessions are processed before their forks.
   // Forks inherit the parent's request objects — deduplicating by responseId prevents
   // the parent's credits from being counted a second time.
@@ -250,8 +263,9 @@ export async function importHistory(since: string | null): Promise<number> {
   // first handles ordering within this run. For a partial import, seed from existing
   // config so sessions before `since` (already stored) block duplicate requests in forks
   // that fall after `since`.
-  const existingCfg = since ? await loadConfig() : null;
-  const seenResponseIds = collectSeenResponseIds(existingCfg?.allocations ?? []);
+  const existingCfg = await loadConfig();
+  const seenResponseIds = collectSeenResponseIds(since ? (existingCfg.allocations ?? []) : []);
+  const overrides = existingCfg.modelPriceOverrides;
 
   // Gather every qualifying allocation first, then apply them all under a SINGLE
   // load→save cycle below. The old code saved config once per session, producing hundreds
@@ -259,7 +273,7 @@ export async function importHistory(since: string | null): Promise<number> {
   // transient file lock (EPERM on rename). One write per import removes that storm.
   const allocations: SessionResult[] = [];
   for (const { file, sessionId, workspaceHash } of chatFiles) {
-    for (const usage of parseChatSession(file, sessionId, workspaceHash)) {
+    for (const usage of parseChatSession(file, sessionId, workspaceHash, overrides)) {
       if (new Date(usage.timestamp).getTime() < sinceMs) {
         // Still collect responseIds from older sessions so forks after `since` are deduped.
         if (usage.requests) {
@@ -317,6 +331,11 @@ async function _sync(): Promise<void> {
   const copilot = cfg.copilot;
   if (!copilot?.enabled) return;
 
+  // Drop any manual price override now made redundant by an official built-in
+  // entry, so this sync (and the notice queued for the UI) reflects it immediately.
+  const superseded = await reconcileManualPriceOverrides();
+  const overrides = superseded.length > 0 ? (await loadConfig()).modelPriceOverrides : cfg.modelPriceOverrides;
+
   const since = copilot.lastSeenEventsAt ?? null;
   const sinceMs = since ? new Date(since).getTime() - MTIME_MARGIN_MS : 0;
   const syncedAt = new Date().toISOString();
@@ -340,7 +359,7 @@ async function _sync(): Promise<void> {
   const seenResponseIds = collectSeenResponseIds(cfg.allocations ?? []);
   changedChat.sort((a, b) => a.mtimeMs - b.mtimeMs);
   for (const { file, sessionId, workspaceHash } of changedChat) {
-    for (const usage of parseChatSession(file, sessionId, workspaceHash)) {
+    for (const usage of parseChatSession(file, sessionId, workspaceHash, overrides)) {
       const deduped = filterDuplicateRequests(usage, seenResponseIds);
       if (deduped.requests) {
         for (const r of deduped.requests) seenResponseIds.add(r.responseId);

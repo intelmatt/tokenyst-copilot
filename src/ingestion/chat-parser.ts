@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { resolveModel, calculateCost, CREDITS_PER_USD } from '../core/pricing';
+import { resolveModel, calculateCost, CREDITS_PER_USD, ManualPriceOverride } from '../core/pricing';
 import { debugLog } from '../util';
 /**
  * Per-request usage data: the cost and timestamp of a single response.
@@ -57,15 +57,23 @@ export interface CopilotSessionUsage {
   title?: string;
   /**
    * Number of requests in this session+model with no known price at all: no
-   * real GitHub credit value and no exact/family pricing match. These
-   * contribute NOTHING to `costUsd` — not even a `$0` placeholder, since that
-   * would misrepresent "unknown" as "free". Omitted (undefined) when there are
-   * none. The UI must never blend this into the displayed total.
+   * real GitHub credit value, no exact/family pricing match, and no
+   * user-entered manual price. These contribute NOTHING to `costUsd` — not
+   * even a `$0` placeholder, since that would misrepresent "unknown" as
+   * "free". Omitted (undefined) when there are none. The UI must never blend
+   * this into the displayed total.
    */
   unpricedRequestCount?: number;
   /** Input/output tokens belonging to the unpriced requests counted above. */
   unpricedInputTokens?: number;
   unpricedOutputTokens?: number;
+  /**
+   * True when one or more requests in this session+model were priced using a
+   * user-entered manual override rather than a real credit value or Tokenyst's
+   * built-in table. Not an error, but the UI should mark these as
+   * user-supplied/unverified rather than authoritative.
+   */
+  hasManualPricing?: boolean;
 }
 
 export interface ChatSessionFile {
@@ -361,7 +369,12 @@ function readRepo(workspaceHash: string): string | undefined {
  * Aggregate one Copilot Chat session file into per-model usage. Returns one
  * record per model used in the session (the user can switch models mid-session).
  */
-export function parseChatSession(file: string, sessionId: string, workspaceHash = ''): CopilotSessionUsage[] {
+export function parseChatSession(
+  file: string,
+  sessionId: string,
+  workspaceHash = '',
+  manualPriceOverrides?: Readonly<Record<string, ManualPriceOverride>>,
+): CopilotSessionUsage[] {
   if (!fs.existsSync(file)) return [];
 
   const records = new Map<string, UsageRecord>();
@@ -389,12 +402,15 @@ export function parseChatSession(file: string, sessionId: string, workspaceHash 
     costUsd: number; input: number; output: number;
     cacheCreation: number; cacheRead: number; cacheWritten: boolean;
     cacheReported: boolean;
-    /** Requests with no real GitHub credit value and no exact/family pricing
-     * match. Tracked entirely separately from `costUsd`/`input`/`output` —
-     * never blended in, not even as a `0`. */
+    /** Requests with no real GitHub credit value, no exact/family pricing
+     * match, and no manual override. Tracked entirely separately from
+     * `costUsd`/`input`/`output` — never blended in, not even as a `0`. */
     unpricedCount: number;
     unpricedInput: number;
     unpricedOutput: number;
+    /** True when at least one request in this session+model was priced using a
+     * user-entered manual override. */
+    hasManualPricing: boolean;
   }
   const perModel = new Map<string, ModelAcc>();
     // Track per-request costs for daily attribution. Only priced requests get an
@@ -402,7 +418,7 @@ export function parseChatSession(file: string, sessionId: string, workspaceHash 
     const perRequestCosts = new Map<string, { costUsd: number; cacheCreation: number; cacheRead: number }>();
   for (const rec of records.values()) {
     const acc = perModel.get(rec.model)
-      ?? { costUsd: 0, input: 0, output: 0, cacheCreation: 0, cacheRead: 0, cacheWritten: false, cacheReported: false, unpricedCount: 0, unpricedInput: 0, unpricedOutput: 0 };
+      ?? { costUsd: 0, input: 0, output: 0, cacheCreation: 0, cacheRead: 0, cacheWritten: false, cacheReported: false, unpricedCount: 0, unpricedInput: 0, unpricedOutput: 0, hasManualPricing: false };
     if (rec.cacheReported) acc.cacheReported = true;
 
     const gh = credits.get(rec.responseId);
@@ -431,15 +447,30 @@ export function parseChatSession(file: string, sessionId: string, workspaceHash 
         acc.input += rec.freshInputTokens + rec.cacheableTokens;
         acc.output += rec.outputTokens;
       } else {
-        // Genuinely no known price for this model. Do NOT fabricate a number —
-        // not a guessed estimate, and not even a `0`, since either would
-        // misrepresent "unknown" as a real, accounted-for figure. Track it in a
-        // completely separate, non-monetary bucket instead, excluded from
-        // costUsd/input/output entirely.
-        priced = false;
-        acc.unpricedCount += 1;
-        acc.unpricedInput += rec.freshInputTokens + rec.cacheableTokens;
-        acc.unpricedOutput += rec.outputTokens;
+        const { manual } = resolveModel(rec.model, manualPriceOverrides);
+        const withOverride = calculateCost(rec.model, rec.freshInputTokens, rec.outputTokens, cc, cr, manualPriceOverrides);
+        if (manual && withOverride != null) {
+          // No real credit line and no built-in table match, but the user has
+          // manually transcribed a price for this model from the Copilot model
+          // picker — use it, and flag the session as manually-priced so the UI
+          // marks it as user-supplied rather than authoritative.
+          requestCostUsd = withOverride;
+          acc.hasManualPricing = true;
+          acc.cacheCreation += cc;
+          acc.cacheRead += cr;
+          acc.input += rec.freshInputTokens + rec.cacheableTokens;
+          acc.output += rec.outputTokens;
+        } else {
+          // Genuinely no known price for this model from any source. Do NOT
+          // fabricate a number — not a guessed estimate, and not even a `0`,
+          // since either would misrepresent "unknown" as a real, accounted-for
+          // figure. Track it in a completely separate, non-monetary bucket
+          // instead, excluded from costUsd/input/output entirely.
+          priced = false;
+          acc.unpricedCount += 1;
+          acc.unpricedInput += rec.freshInputTokens + rec.cacheableTokens;
+          acc.unpricedOutput += rec.outputTokens;
+        }
       }
       acc.costUsd += requestCostUsd;
     }
@@ -458,9 +489,10 @@ export function parseChatSession(file: string, sessionId: string, workspaceHash 
 
   const result: CopilotSessionUsage[] = [];
   for (const [model, acc] of perModel) {
-    // Keep a session even at costUsd === 0 when it has unpriced usage — dropping
-    // it here would silently hide genuinely-unknown spend from the UI.
-    if (acc.costUsd <= 0 && acc.unpricedCount === 0) continue;
+    // Keep a session even at costUsd === 0 when it has unpriced usage or was
+    // manually priced — dropping it here would silently hide genuinely-unknown
+    // spend from the UI (see the unpricedCount doc comment on CopilotSessionUsage).
+    if (acc.costUsd <= 0 && acc.unpricedCount === 0 && !acc.hasManualPricing) continue;
         // Build requests array: filter per-model requests with their timestamps and costs
         const requests: PerRequestUsage[] = [];
         for (const rec of records.values()) {
@@ -496,6 +528,7 @@ export function parseChatSession(file: string, sessionId: string, workspaceHash 
       unpricedRequestCount: acc.unpricedCount > 0 ? acc.unpricedCount : undefined,
       unpricedInputTokens: acc.unpricedCount > 0 ? acc.unpricedInput : undefined,
       unpricedOutputTokens: acc.unpricedCount > 0 ? acc.unpricedOutput : undefined,
+      hasManualPricing: acc.hasManualPricing || undefined,
     });
   }
   return result;

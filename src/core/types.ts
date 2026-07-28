@@ -48,4 +48,8 @@ export interface SessionResult {
   /** Input/output tokens belonging to the unpriced requests counted above. */
   unpricedInputTokens?: number;
   unpricedOutputTokens?: number;
+  /** True when this allocation was priced (in full or in part) using a
+   * user-entered manual override rather than a real credit value or built-in
+   * table. */
+  hasManualPricing?: boolean;
 }
