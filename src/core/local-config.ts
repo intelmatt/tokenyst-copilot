@@ -466,6 +466,13 @@ export function applyCopilotSessionUpsert(
     if (session.title) existing.title = session.title;
     if (session.at) existing.at = session.at;
     if (session.responseIds) existing.responseIds = session.responseIds;
+    // Assigned unconditionally (unlike the fields above): a re-synced session whose
+    // model has since gained a price carries no unpriced counters, and must CLEAR the
+    // stale ones rather than keep reporting usage that is no longer unpriced.
+    existing.unpricedRequestCount = session.unpricedRequestCount;
+    existing.unpricedInputTokens = session.unpricedInputTokens;
+    existing.unpricedOutputTokens = session.unpricedOutputTokens;
+    existing.hasManualPricing = session.hasManualPricing;
     return { success: true, inserted: false };
   }
 
@@ -493,6 +500,10 @@ export function applyCopilotSessionUpsert(
     sessionId: session.sessionId,
     title: session.title,
     responseIds: session.responseIds,
+    unpricedRequestCount: session.unpricedRequestCount,
+    unpricedInputTokens: session.unpricedInputTokens,
+    unpricedOutputTokens: session.unpricedOutputTokens,
+    hasManualPricing: session.hasManualPricing,
   });
   return { success: true, inserted: true };
 }
